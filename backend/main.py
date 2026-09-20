@@ -1,7 +1,30 @@
-from fastapi import FastAPI
+from xml.sax.saxutils import escape
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from email import policy
+from email.parser import BytesParser
+import dns.resolver
+import requests
+import ipaddress
+import spf
+import re
+import base64
+from dotenv import load_dotenv
+import os
+import sqlite3
+from datetime import datetime, timezone
+from io import BytesIO
+from fastapi.responses import StreamingResponse
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+load_dotenv()
 
+VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY")
 app = FastAPI(title="MailTrace AI API")
 
 app.add_middleware(
@@ -17,6 +40,883 @@ class EmailRequest(BaseModel):
     email: str
 
 
+def analyze_email_nlp(email_text: str, headers: dict, urls: list):
+    """AI-assisted, explainable NLP analysis for email threat language.
+
+    This is intentionally a lightweight local NLP layer. It extracts semantic
+    threat patterns without claiming that the score is a probability of attack
+    or pretending that a trained ML model is being used.
+    """
+    text = email_text or ""
+    lower = text.lower()
+
+    categories = {
+        "urgency": [
+            "urgent", "immediately", "act now", "within 24 hours",
+            "final warning", "expires today", "account will be suspended",
+            "account suspended", "account locked",
+        ],
+        "credential_harvesting": [
+            "password", "username and password", "login credentials",
+            "verify your account", "verify your identity", "sign in",
+            "signin", "authenticate", "authentication required",
+        ],
+        "financial_fraud": [
+            "payment required", "invoice", "refund", "bank account",
+            "credit card", "wire transfer", "gift card", "payment",
+        ],
+        "social_engineering": [
+            "verify", "confirm your identity", "security alert",
+            "unusual activity", "suspicious activity", "click here",
+            "do not ignore", "action required", "failure to comply",
+        ],
+    }
+
+    category_matches = {}
+    for category, phrases in categories.items():
+        matches = [phrase for phrase in phrases if phrase in lower]
+        if matches:
+            category_matches[category] = matches
+
+    # Look for a display-name / domain mismatch that is useful to NLP context.
+    from_value = str((headers or {}).get("from") or "")
+    reply_to = str((headers or {}).get("reply-to") or "")
+    brand_context = []
+    brand_patterns = {
+        "Microsoft": ["microsoft", "micr0soft"],
+        "Google": ["google", "g00gle"],
+        "Apple": ["apple", "app1e"],
+        "PayPal": ["paypal", "paypa1"],
+        "Amazon": ["amazon", "amaz0n"],
+    }
+    sender_context = from_value.lower()
+    for brand, patterns in brand_patterns.items():
+        if any(pattern in sender_context for pattern in patterns):
+            brand_context.append(brand)
+
+    suspicious_url_context = []
+    url_words = [
+        "login", "signin", "verify", "verification", "account",
+        "secure", "password", "authenticate", "update",
+    ]
+    for url in urls or []:
+        url_lower = str(url).lower()
+        matches = [word for word in url_words if word in url_lower]
+        if matches:
+            suspicious_url_context.append({
+                "url": str(url),
+                "signals": matches,
+            })
+
+    mismatch = False
+    if "@" in from_value and "@" in reply_to:
+        sender_domain = from_value.rsplit("@", 1)[-1].replace(">", "").strip().lower()
+        reply_domain = reply_to.rsplit("@", 1)[-1].replace(">", "").strip().lower()
+        mismatch = bool(sender_domain and reply_domain and sender_domain != reply_domain)
+
+    signal_points = 0
+    category_weights = {
+        "urgency": 20,
+        "credential_harvesting": 30,
+        "financial_fraud": 20,
+        "social_engineering": 20,
+    }
+    for category, matches in category_matches.items():
+        signal_points += min(len(matches) * 5, category_weights[category])
+    if suspicious_url_context:
+        signal_points += min(len(suspicious_url_context) * 10, 20)
+    if mismatch:
+        signal_points += 15
+    if brand_context:
+        signal_points += 10
+    signal_points = min(signal_points, 100)
+
+    if category_matches.get("credential_harvesting") and suspicious_url_context:
+        primary_threat = "Credential phishing"
+    elif category_matches.get("financial_fraud"):
+        primary_threat = "Financial fraud / payment scam"
+    elif category_matches.get("credential_harvesting"):
+        primary_threat = "Credential harvesting"
+    elif category_matches.get("urgency") and category_matches.get("social_engineering"):
+        primary_threat = "Social engineering"
+    elif suspicious_url_context:
+        primary_threat = "Suspicious link-based social engineering"
+    elif category_matches:
+        primary_threat = "Suspicious social engineering"
+    else:
+        primary_threat = "No strong NLP threat pattern detected"
+
+    if signal_points >= 70:
+        assessment = "Strong threat-language indicators"
+    elif signal_points >= 40:
+        assessment = "Moderate threat-language indicators"
+    elif signal_points > 0:
+        assessment = "Limited threat-language indicators"
+    else:
+        assessment = "No strong threat-language indicators"
+
+    return {
+        "engine": "AI-assisted NLP pattern analysis",
+        "assessment": assessment,
+        "signal_score": signal_points,
+        "primary_threat": primary_threat,
+        "categories": category_matches,
+        "brand_context": brand_context,
+        "reply_to_domain_mismatch": mismatch,
+        "suspicious_url_context": suspicious_url_context,
+        "note": (
+            "This NLP layer extracts explainable language and context signals. "
+            "The signal score is not a probability of maliciousness and does not "
+            "represent a trained-model accuracy claim."
+        ),
+    }
+
+def check_spf(domain: str):
+    try:
+        resolver = dns.resolver.Resolver()
+
+        # Use public DNS resolvers
+        resolver.nameservers = [
+            "8.8.8.8",
+            "1.1.1.1",
+        ]
+
+        resolver.timeout = 3
+        resolver.lifetime = 6
+
+        answers = resolver.resolve(domain, "TXT")
+
+        for answer in answers:
+            record = answer.to_text().strip('"')
+
+            if record.startswith("v=spf1"):
+                return {
+                    "status": "found",
+                    "record": record,
+                }
+
+        return {
+            "status": "not_found",
+            "record": None,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "record": None,
+            "error": str(e),
+        }
+def check_dkim(domain: str, selector: str):
+    try:
+        resolver = dns.resolver.Resolver()
+
+        resolver.nameservers = [
+            "8.8.8.8",
+            "1.1.1.1",
+        ]
+
+        resolver.timeout = 3
+        resolver.lifetime = 6
+
+        dkim_domain = f"{selector}._domainkey.{domain}"
+
+        answers = resolver.resolve(dkim_domain, "TXT")
+
+        records = []
+
+        for answer in answers:
+            record = answer.to_text().strip('"')
+            records.append(record)
+
+        return {
+            "status": "key_found",
+            "domain": domain,
+            "selector": selector,
+            "dns_name": dkim_domain,
+            "records": records,
+        }
+
+    except dns.resolver.NXDOMAIN:
+        return {
+            "status": "key_not_found",
+            "domain": domain,
+            "selector": selector,
+            "dns_name": dkim_domain,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "domain": domain,
+            "selector": selector,
+            "dns_name": dkim_domain,
+            "error": str(e),
+        }
+def check_dmarc(domain: str):
+    try:
+        resolver = dns.resolver.Resolver()
+
+        resolver.nameservers = [
+            "8.8.8.8",
+            "1.1.1.1",
+        ]
+
+        resolver.timeout = 3
+        resolver.lifetime = 6
+
+        dmarc_domain = f"_dmarc.{domain}"
+
+        answers = resolver.resolve(dmarc_domain, "TXT")
+
+        for answer in answers:
+            record = answer.to_text().strip('"')
+
+            if record.lower().startswith("v=dmarc1"):
+                return {
+                    "status": "found",
+                    "domain": domain,
+                    "dns_name": dmarc_domain,
+                    "record": record,
+                }
+
+        return {
+            "status": "not_found",
+            "domain": domain,
+            "dns_name": dmarc_domain,
+        }
+
+    except dns.resolver.NXDOMAIN:
+        return {
+            "status": "not_found",
+            "domain": domain,
+            "dns_name": dmarc_domain,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "domain": domain,
+            "dns_name": dmarc_domain,
+            "error": str(e),
+        }   
+def domains_align(domain1: str, domain2: str):
+    if not domain1 or not domain2:
+        return False
+    return domain1.lower().strip(".") == domain2.lower().strip(".")   
+def evaluate_dmarc(
+    from_domain: str,
+    spf_result: dict | None,
+    dkim_result: dict | None,
+):
+    spf_pass_aligned = (
+        spf_result is not None
+        and spf_result.get("status") == "pass"
+        and spf_result.get("alignment") == "aligned"
+    )
+
+    dkim_pass_aligned = (
+        dkim_result is not None
+        and dkim_result.get("status") == "pass"
+        and dkim_result.get("alignment") == "aligned"
+    )
+
+    if spf_pass_aligned or dkim_pass_aligned:
+        return {
+            "status": "pass",
+            "from_domain": from_domain,
+            "spf_aligned": spf_pass_aligned,
+            "dkim_aligned": dkim_pass_aligned,
+            "reason": "At least one aligned authentication mechanism passed."
+        }
+
+    return {
+        "status": "fail",
+        "from_domain": from_domain,
+        "spf_aligned": spf_pass_aligned,
+        "dkim_aligned": dkim_pass_aligned,
+        "reason": "Neither SPF nor DKIM passed with alignment."
+    }
+def extract_urls(email_text: str):
+    url_pattern = r"https?://[^\s<>\"]+"
+
+    urls = re.findall(
+        url_pattern,
+        email_text,
+        re.IGNORECASE
+    )
+
+    # Remove duplicates while preserving order
+    unique_urls = []
+
+    for url in urls:
+        url = url.rstrip(".,;:!?)]}")
+
+        if url not in unique_urls:
+            unique_urls.append(url)
+
+    return unique_urls 
+from urllib.parse import urlparse
+
+
+def extract_url_domains(urls: list[str]):
+    domains = []
+
+    for url in urls:
+        try:
+            hostname = urlparse(url).hostname
+
+            if hostname:
+                hostname = hostname.lower()
+
+                if hostname not in domains:
+                    domains.append(hostname)
+
+        except Exception:
+            continue
+
+    return domains
+
+
+def check_domain_intelligence(domain: str):
+    """Collect passive DNS + RDAP registration intelligence for a domain."""
+    domain = (domain or "").strip().lower().rstrip(".")
+
+    result = {
+        "domain": domain,
+        "status": "ok",
+        "dns": {},
+        "rdap": {},
+        "signals": [],
+    }
+
+    if not domain:
+        result["status"] = "invalid"
+        return result
+
+    resolver = dns.resolver.Resolver()
+    resolver.nameservers = ["8.8.8.8", "1.1.1.1"]
+    resolver.timeout = 3
+    resolver.lifetime = 6
+
+    for record_type in ["A", "AAAA", "MX", "NS", "TXT"]:
+        try:
+            answers = resolver.resolve(domain, record_type)
+            values = [answer.to_text().strip('\"') for answer in answers]
+            result["dns"][record_type] = values
+        except Exception:
+            result["dns"][record_type] = []
+
+    # Passive registration data through the public RDAP service.
+    try:
+        response = requests.get(
+            f"https://rdap.org/domain/{domain}",
+            headers={"Accept": "application/rdap+json, application/json"},
+            timeout=8,
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            events = data.get("events", [])
+            event_map = {}
+            for event in events:
+                action = event.get("eventAction")
+                date = event.get("eventDate")
+                if action and date:
+                    event_map[action] = date
+
+            registrar = None
+            for entity in data.get("entities", []):
+                roles = entity.get("roles", [])
+                if "registrar" in roles:
+                    vcard = entity.get("vcardArray", [])
+                    if len(vcard) > 1:
+                        for item in vcard[1]:
+                            if len(item) >= 4 and item[0] in ("fn", "org"):
+                                registrar = item[3]
+                                break
+                    if registrar:
+                        break
+
+            nameservers = []
+            for ns in data.get("nameservers", []):
+                name = ns.get("ldhName")
+                if name:
+                    nameservers.append(name)
+
+            result["rdap"] = {
+                "status": "found",
+                "registrar": registrar,
+                "created": event_map.get("registration"),
+                "updated": event_map.get("last changed") or event_map.get("last update of RDAP database"),
+                "expires": event_map.get("expiration"),
+                "status_codes": data.get("status", []),
+                "nameservers": nameservers,
+            }
+
+            if event_map.get("registration"):
+                result["signals"].append("Domain registration date is available from RDAP.")
+            else:
+                result["signals"].append("RDAP returned no registration date.")
+        elif response.status_code == 404:
+            result["rdap"] = {"status": "not_found"}
+            result["signals"].append("No RDAP registration record was found for this domain.")
+        else:
+            result["rdap"] = {"status": "error", "http_status": response.status_code}
+            result["signals"].append("RDAP lookup could not be completed.")
+    except Exception as e:
+        result["rdap"] = {"status": "error", "message": str(e)}
+        result["signals"].append("RDAP lookup could not be completed.")
+
+    if not any(result["dns"].get(record) for record in ["A", "AAAA", "MX", "NS"]):
+        result["signals"].append("No common DNS records were returned for this domain.")
+
+    if not result["dns"].get("MX"):
+        result["signals"].append("No MX record was found for this domain.")
+
+    return result
+
+
+def analyze_attachment_metadata(filename: str | None, content_type: str | None, size: int):
+    """Classify an email attachment using metadata only. Never executes attachment content."""
+    filename = filename or "unnamed"
+    content_type = content_type or "application/octet-stream"
+    name_lower = filename.lower().strip()
+
+    dangerous_extensions = {
+        ".exe", ".scr", ".bat", ".cmd", ".com", ".js", ".jse",
+        ".vbs", ".vbe", ".ps1", ".msi", ".dll", ".hta", ".jar",
+        ".wsf", ".wsh", ".reg"
+    }
+    script_extensions = {
+        ".js", ".jse", ".vbs", ".vbe", ".ps1", ".hta", ".wsf", ".wsh"
+    }
+    archive_extensions = {".zip", ".rar", ".7z", ".iso", ".img"}
+    document_extensions = {
+        ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+        ".docm", ".xlsm", ".pptm"
+    }
+
+    suffixes = re.findall(r"\.[a-z0-9]{1,10}", name_lower)
+    extension = suffixes[-1] if suffixes else ""
+
+    signals = []
+    risk = "Low"
+    points = 0
+
+    if extension in dangerous_extensions:
+        risk = "Critical"
+        points = 25
+        signals.append("Executable or script attachment type detected.")
+    elif extension in archive_extensions:
+        risk = "Medium"
+        points = 10
+        signals.append("Archive attachment can contain additional files that require inspection.")
+    elif extension in document_extensions:
+        risk = "Medium"
+        points = 5
+        signals.append("Office document attachment detected; macros or embedded content may require inspection.")
+
+    # Detect filenames such as invoice.pdf.exe or image.jpg.js.
+    if len(suffixes) >= 2 and suffixes[-1] in dangerous_extensions:
+        risk = "Critical"
+        points = max(points, 30)
+        signals.append("Double-extension filename can disguise an executable or script.")
+
+    suspicious_name_words = [
+        "invoice", "payment", "refund", "password", "credential",
+        "security", "verify", "urgent", "update", "account"
+    ]
+    matched_words = [word for word in suspicious_name_words if word in name_lower]
+    if matched_words and extension in dangerous_extensions:
+        points = min(points + 5, 35)
+        signals.append(
+            "Suspicious filename keywords detected: " + ", ".join(matched_words)
+        )
+
+    executable_mime_types = {
+        "application/x-msdownload",
+        "application/x-dosexec",
+        "application/x-executable",
+        "application/vnd.microsoft.portable-executable",
+    }
+    script_mime = (
+        content_type in {
+            "application/javascript",
+            "text/javascript",
+            "application/x-javascript",
+            "text/x-python",
+            "text/vbscript",
+        }
+    )
+
+    if content_type in executable_mime_types or script_mime:
+        risk = "Critical"
+        points = max(points, 30)
+        signals.append("Executable or script MIME type detected.")
+
+    if size > 10 * 1024 * 1024:
+        signals.append("Attachment is larger than 10 MB.")
+    elif size == 0:
+        signals.append("Attachment contains no decoded payload.")
+
+    if risk == "Low" and signals:
+        risk = "Medium"
+
+    return {
+        "filename": filename,
+        "content_type": content_type,
+        "size": size,
+        "extension": extension or None,
+        "risk": risk,
+        "risk_points": points,
+        "signals": signals,
+        "analysis": (
+            "Metadata-only attachment analysis. The attachment was not opened or executed."
+        ),
+    }
+
+
+def check_virustotal_url(url: str):
+    if not VIRUSTOTAL_API_KEY:
+        return {
+            "status": "error",
+            "message": "VirusTotal API key is not configured."
+        }
+
+    try:
+        # VirusTotal accepts an unpadded Base64 URL identifier
+        url_id = base64.urlsafe_b64encode(
+            url.encode()
+        ).decode().rstrip("=")
+
+        response = requests.get(
+            f"https://www.virustotal.com/api/v3/urls/{url_id}",
+            headers={
+                "x-apikey": VIRUSTOTAL_API_KEY
+            },
+            timeout=10
+        )
+
+        if response.status_code == 404:
+            return {
+                "status": "not_found",
+                "url": url,
+                "message": "URL has no existing VirusTotal report."
+            }
+
+        if response.status_code != 200:
+            return {
+                "status": "error",
+                "url": url,
+                "http_status": response.status_code,
+                "message": "VirusTotal request failed."
+            }
+
+        data = response.json()
+
+        attributes = data.get("data", {}).get("attributes", {})
+
+        stats = attributes.get(
+            "last_analysis_stats",
+            {}
+        )
+
+        return {
+            "status": "found",
+            "url": url,
+            "malicious": stats.get("malicious", 0),
+            "suspicious": stats.get("suspicious", 0),
+            "harmless": stats.get("harmless", 0),
+            "undetected": stats.get("undetected", 0),
+            "reputation": attributes.get("reputation"),
+            "last_analysis_date": attributes.get(
+                "last_analysis_date"
+            )
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "url": url,
+            "message": str(e)
+        }
+def lookup_ip(ip: str):
+    try:
+        response = requests.get(
+            f"http://ip-api.com/json/{ip}",
+            params={
+                "fields": "status,message,country,regionName,city,lat,lon,isp,org,as,query"
+            },
+            timeout=5,
+        )
+
+        data = response.json()
+
+        if data.get("status") == "success":
+            return {
+                "status": "found",
+                "ip": data.get("query"),
+                "country": data.get("country"),
+                "region": data.get("regionName"),
+                "city": data.get("city"),
+                "latitude": data.get("lat"),
+                "longitude": data.get("lon"),
+                "isp": data.get("isp"),
+                "organization": data.get("org"),
+                "asn": data.get("as"),
+                "location_accuracy": "approximate",
+            }
+
+        return {
+            "status": "not_found",
+            "ip": ip,
+            "message": data.get("message"),
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "ip": ip,
+            "error": str(e),
+        }
+def check_virustotal_ip(ip: str):
+    if not VIRUSTOTAL_API_KEY:
+        return {
+            "status": "unavailable",
+            "ip": ip,
+            "message": "VirusTotal API key is not configured."
+        }
+
+    try:
+        response = requests.get(
+            f"https://www.virustotal.com/api/v3/ip_addresses/{ip}",
+            headers={
+                "x-apikey": VIRUSTOTAL_API_KEY
+            },
+            timeout=10,
+        )
+
+        if response.status_code == 404:
+            return {
+                "status": "not_found",
+                "ip": ip,
+                "message": "IP address not found in VirusTotal."
+            }
+
+        response.raise_for_status()
+
+        data = response.json().get("data", {})
+        attributes = data.get("attributes", {})
+        stats = attributes.get("last_analysis_stats", {})
+
+        return {
+            "status": "found",
+            "ip": ip,
+            "reputation": attributes.get("reputation", 0),
+            "malicious": stats.get("malicious", 0),
+            "suspicious": stats.get("suspicious", 0),
+            "harmless": stats.get("harmless", 0),
+            "undetected": stats.get("undetected", 0),
+            "last_analysis_date": attributes.get("last_analysis_date"),
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "ip": ip,
+            "error": str(e),
+        }   
+def is_public_ip(ip: str):
+    try:
+        address = ipaddress.ip_address(ip)
+
+        return (
+            address.is_global
+            and not address.is_private
+            and not address.is_loopback
+            and not address.is_reserved
+            and not address.is_multicast
+        )
+
+    except ValueError:
+        return False    
+
+
+def build_threat_intelligence_summary(
+    ip_intelligence: list,
+    domain_intelligence: list,
+    url_intelligence: list,
+):
+    """Build a transparent threat-intelligence summary from available signals."""
+    indicators = []
+    malicious_ips = 0
+    suspicious_ips = 0
+    malicious_urls = 0
+    suspicious_urls = 0
+
+    for item in ip_intelligence:
+        reputation = item.get("reputation") or {}
+        malicious = int(reputation.get("malicious") or 0)
+        suspicious = int(reputation.get("suspicious") or 0)
+
+        if malicious > 0:
+            malicious_ips += 1
+            indicators.append({
+                "type": "IP",
+                "value": item.get("ip"),
+                "severity": "High",
+                "reason": f"VirusTotal reported {malicious} malicious detection(s).",
+            })
+        elif suspicious > 0:
+            suspicious_ips += 1
+            indicators.append({
+                "type": "IP",
+                "value": item.get("ip"),
+                "severity": "Medium",
+                "reason": f"VirusTotal reported {suspicious} suspicious detection(s).",
+            })
+
+    for item in url_intelligence:
+        malicious = int(item.get("malicious") or 0)
+        suspicious = int(item.get("suspicious") or 0)
+
+        if malicious > 0:
+            malicious_urls += 1
+            indicators.append({
+                "type": "URL",
+                "value": item.get("url"),
+                "severity": "High",
+                "reason": f"VirusTotal reported {malicious} malicious detection(s).",
+            })
+        elif suspicious > 0:
+            suspicious_urls += 1
+            indicators.append({
+                "type": "URL",
+                "value": item.get("url"),
+                "severity": "Medium",
+                "reason": f"VirusTotal reported {suspicious} suspicious detection(s).",
+            })
+
+    domain_signals = []
+    for item in domain_intelligence:
+        for signal in item.get("signals", []):
+            domain_signals.append({
+                "type": "Domain",
+                "value": item.get("domain"),
+                "severity": "Info",
+                "reason": signal,
+            })
+
+    indicators.extend(domain_signals)
+
+    if malicious_ips or malicious_urls:
+        overall = "High"
+    elif suspicious_ips or suspicious_urls:
+        overall = "Medium"
+    elif ip_intelligence or url_intelligence or domain_intelligence:
+        overall = "Informational"
+    else:
+        overall = "No Data"
+
+    return {
+        "overall_status": overall,
+        "summary": {
+            "ips_checked": len(ip_intelligence),
+            "malicious_ips": malicious_ips,
+            "suspicious_ips": suspicious_ips,
+            "urls_checked": len(url_intelligence),
+            "malicious_urls": malicious_urls,
+            "suspicious_urls": suspicious_urls,
+            "domains_checked": len(domain_intelligence),
+        },
+        "indicators": indicators,
+        "note": (
+            "Threat-intelligence results are external intelligence signals. "
+            "A clean result does not prove an indicator is safe, and a detection "
+            "does not by itself prove who sent the email."
+        ),
+    }
+
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "investigations.db")
+
+
+def init_database():
+    connection = sqlite3.connect(DB_PATH)
+    cursor = connection.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS investigations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            sender TEXT,
+            recipient TEXT,
+            subject TEXT,
+            threat_score INTEGER,
+            risk_level TEXT,
+            classification TEXT,
+            origin_ip TEXT,
+            result_json TEXT NOT NULL
+        )
+    """)
+    connection.commit()
+    connection.close()
+
+
+def save_investigation(result: dict):
+    headers = result.get("headers", {})
+    connection = sqlite3.connect(DB_PATH)
+    cursor = connection.cursor()
+    cursor.execute("""
+        INSERT INTO investigations (
+            created_at, sender, recipient, subject,
+            threat_score, risk_level, classification,
+            origin_ip, result_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        datetime.now(timezone.utc).isoformat(),
+        headers.get("from"),
+        headers.get("to"),
+        headers.get("subject"),
+        result.get("threat_score", 0),
+        result.get("risk_level"),
+        result.get("classification"),
+        result.get("candidate_origin_ip"),
+        __import__("json").dumps(result, default=str),
+    ))
+    investigation_id = cursor.lastrowid
+    connection.commit()
+    connection.close()
+    return investigation_id
+
+
+def update_investigation_result(investigation_id: int, result: dict):
+    headers = result.get("headers", {})
+    connection = sqlite3.connect(DB_PATH)
+    cursor = connection.cursor()
+    cursor.execute("""
+        UPDATE investigations
+        SET sender = ?, recipient = ?, subject = ?,
+            threat_score = ?, risk_level = ?, classification = ?,
+            origin_ip = ?, result_json = ?
+        WHERE id = ?
+    """, (
+        headers.get("from"),
+        headers.get("to"),
+        headers.get("subject"),
+        result.get("threat_score", 0),
+        result.get("risk_level"),
+        result.get("classification"),
+        result.get("candidate_origin_ip"),
+        __import__("json").dumps(result, default=str),
+        investigation_id,
+    ))
+    connection.commit()
+    connection.close()
+
+
+init_database()
+
 @app.get("/")
 def root():
     return {"message": "MailTrace AI backend is running!"}
@@ -30,6 +930,7 @@ def health():
 @app.post("/analyze")
 def analyze_email(request: EmailRequest):
     email_text = request.email
+    email_lower = email_text.lower()
 
     headers = {}
 
@@ -45,12 +946,1620 @@ def analyze_email(request: EmailRequest):
                 "date",
                 "return-path",
                 "reply-to",
+                "received"
             ]:
                 headers[name] = value.strip()
 
-    return {
+    score = 0
+    findings = []
+    score_breakdown = []
+    # Extract URLs from the email
+    urls = extract_urls(email_text)
+    url_domains = extract_url_domains(urls)
+
+    # Collect domain intelligence for the sender domain and URL domains.
+    sender_domain_for_intel = ""
+    if headers.get("from", "") and "@" in headers.get("from", ""):
+        sender_domain_for_intel = headers.get("from", "").split("@")[-1].replace(">", "").strip().lower()
+
+    intelligence_domains = []
+    for domain in [sender_domain_for_intel] + url_domains:
+        if domain and domain not in intelligence_domains:
+            intelligence_domains.append(domain)
+
+    domain_intelligence = [
+        check_domain_intelligence(domain)
+        for domain in intelligence_domains[:5]
+    ]
+
+    # Check extracted URLs against VirusTotal
+    url_intelligence = []
+
+    for url in urls:
+        result = check_virustotal_url(url)
+        url_intelligence.append(result)
+        # Add VirusTotal URL intelligence to the risk score
+    for result in url_intelligence:
+        if result.get("status") != "found":
+            continue
+
+        malicious = result.get("malicious", 0)
+        suspicious = result.get("suspicious", 0)
+
+        if malicious > 0:
+            score += min(30, malicious * 5)
+
+            findings.append(
+                f"VirusTotal flagged the URL as malicious by {malicious} security engine(s)."
+            )
+
+        elif suspicious > 0:
+            score += min(15, suspicious * 3)
+
+            findings.append(
+                f"VirusTotal flagged the URL as suspicious by {suspicious} security engine(s)."
+            )
+
+        else:
+            findings.append(
+                "VirusTotal found no malicious or suspicious detections for the URL."
+            )    
+    # Get sender and Reply-To
+    sender = headers.get("from", "")
+    reply_to = headers.get("reply-to", "")
+    return_path = headers.get("return-path", "")
+        # Detect DKIM-Signature header
+    dkim_result = None
+
+    dkim_header = None
+
+    for line in email_text.splitlines():
+        if line.lower().startswith("dkim-signature:"):
+            dkim_header = line
+            break
+
+    if dkim_header:
+        dkim_domain_match = re.search(
+            r"\bd=([^;\s]+)",
+            dkim_header,
+            re.IGNORECASE
+        )
+
+        dkim_selector_match = re.search(
+            r"\bs=([^;\s]+)",
+            dkim_header,
+            re.IGNORECASE
+        )
+
+        if dkim_domain_match and dkim_selector_match:
+            dkim_domain = dkim_domain_match.group(1).strip()
+            dkim_selector = dkim_selector_match.group(1).strip()
+
+            dkim_result = check_dkim(
+                dkim_domain,
+                dkim_selector
+            )
+            # Check DKIM signing-domain alignment
+            if sender and "@" in sender:
+                from_domain = sender.split("@")[-1].replace(">", "").strip()
+
+                dkim_aligned = domains_align(
+                    from_domain,
+                    dkim_domain
+                )
+
+                dkim_result["from_domain"] = from_domain
+                dkim_result["alignment"] = (
+                    "aligned" if dkim_aligned else "not_aligned"
+                )
+
+                if dkim_aligned:
+                    findings.append(
+                        "DKIM signing domain aligns with the visible From domain."
+                    )
+                else:
+                    findings.append(
+                        "DKIM signing domain does not align with the visible From domain."
+                    )
+        else:
+            dkim_result = {
+                "status": "invalid_header",
+                "message": "DKIM-Signature header was found, but domain or selector could not be extracted."
+            }
+                # Add DKIM result to evidence-based findings
+    if dkim_result:
+        dkim_status = dkim_result.get("status", "")
+
+        if dkim_status == "key_found":
+            findings.append(
+                "DKIM public key found. Cryptographic signature verification has not yet been performed."
+            )
+
+        elif dkim_status == "key_not_found":
+            score += 15
+            findings.append(
+                "DKIM verification problem: no public key was found for the signing domain and selector."
+            )
+
+        elif dkim_status == "invalid_header":
+            score += 5
+            findings.append(
+                "DKIM-Signature header is present but could not be parsed correctly."
+            )
+
+        elif dkim_status == "not_present":
+            findings.append(
+                "No DKIM-Signature header was found."
+            )
+
+        elif dkim_status == "error":
+            findings.append(
+                "DKIM public-key lookup could not be completed."
+            )
+    else:
+        dkim_result = {
+            "status": "not_present",
+            "message": "No DKIM-Signature header was found."
+        }
+        # Check DMARC policy
+    dmarc_result = None
+
+    if sender and "@" in sender:
+        sender_domain = sender.split("@")[-1].replace(">", "").strip()
+
+        dmarc_result = check_dmarc(sender_domain)  
+ 
+
+    # it is not, by itself, evidence that this email is malicious.
+    if dmarc_result:
+        dmarc_status = dmarc_result.get("status", "")
+
+        if dmarc_status == "found":
+            findings.append(
+                "DMARC policy found for the sender domain."
+            )
+
+        elif dmarc_status == "not_found":
+            findings.append(
+                "No DMARC policy was found for the sender domain."
+            )
+
+        elif dmarc_status == "error":
+            findings.append(
+                "DMARC policy lookup could not be completed."
+            )
+    # Real SPF DNS lookup
+    spf_result = None
+        # Extract IP addresses from Received headers
+    received_headers = []
+
+    for line in email_text.splitlines():
+        if line.lower().startswith("received:"):
+            received_headers.append(line)
+
+    # Build a forensic relay path
+    relay_path = []
+
+    for index, received in enumerate(received_headers, start=1):
+        found_ips = re.findall(
+            r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+            received
+        )
+
+        hop_details = []
+
+        for ip in found_ips:
+            intelligence = lookup_ip(ip)
+
+            hop_details.append({
+                "ip": ip,
+                "country": intelligence.get("country"),
+                "region": intelligence.get("region"),
+                "city": intelligence.get("city"),
+                "isp": intelligence.get("isp"),
+                "organization": intelligence.get("organization"),
+                "asn": intelligence.get("asn"),
+            })
+
+        relay_path.append({
+            "hop": index,
+            "header": received,
+            "ip_addresses": found_ips,
+            "intelligence": hop_details,
+        })
+
+    ip_addresses = []
+
+    for received in received_headers:
+        found_ips = re.findall(
+            r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+            received
+        )
+
+        for ip in found_ips:
+            if ip not in ip_addresses and is_public_ip(ip):
+                ip_addresses.append(ip)
+
+    ip_addresses = []
+
+    for received in received_headers:
+        found_ips = re.findall(
+            r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+            received
+        )
+
+        for ip in found_ips:
+            if ip not in ip_addresses and is_public_ip(ip):
+                ip_addresses.append(ip)
+    # Identify the oldest public IP as a candidate originating IP.
+    # This is a candidate only because Received headers must be
+    # interpreted in the context of trusted mail infrastructure.
+    candidate_origin_ip = None
+
+    if ip_addresses:
+        candidate_origin_ip = ip_addresses[-1]            
+    # Look up real information for each extracted IP
+    ip_intelligence = []
+
+    for ip in ip_addresses:
+        intelligence = lookup_ip(ip)
+
+        reputation = check_virustotal_ip(ip)
+
+        intelligence["reputation"] = reputation
+
+        if reputation.get("malicious", 0) > 0:
+            intelligence["role"] = "Suspicious Infrastructure"
+        else:
+            intelligence["role"] = "Relay Server"
+
+        ip_intelligence.append(intelligence)
+    # Get intelligence for the candidate originating IP
+    candidate_origin_intelligence = None
+
+    if candidate_origin_ip:
+        for intelligence in ip_intelligence:
+            if intelligence.get("ip") == candidate_origin_ip:
+                candidate_origin_intelligence = intelligence
+                break
+    # Real SPF evaluation using sender domain and sending IP
+    spf_result = None
+
+    if return_path and "@" in return_path and ip_addresses:
+        envelope_sender = return_path.strip("<> ")
+        envelope_domain = envelope_sender.split("@")[-1].strip()
+        sending_ip = ip_addresses[0]
+
+        helo_hostname = "unknown"
+
+        if received_headers:
+            match = re.search(
+                r"from\s+([A-Za-z0-9.-]+)",
+                received_headers[0],
+                re.IGNORECASE
+            )
+
+            if match:
+                helo_hostname = match.group(1)
+
+        try:
+            result, explanation = spf.check2(
+                sending_ip,
+                envelope_sender,
+                helo_hostname
+            )
+
+            spf_result = {
+                "status": result,
+                "explanation": explanation,
+                "envelope_sender": envelope_sender,
+                "domain": envelope_domain,
+                "sending_ip": sending_ip,
+            }
+
+        except Exception as e:
+            spf_result = {
+                "status": "error",
+                "envelope_sender": envelope_sender,
+                "domain": envelope_domain,
+                "sending_ip": sending_ip,
+                "error": str(e),
+            }
+
+    elif sender and "@" in sender and ip_addresses:
+        spf_result = {
+            "status": "not_evaluated",
+            "message": "SPF was not evaluated because the SMTP envelope sender (Return-Path) was not available.",
+            "sending_ip": ip_addresses[0],
+        }
+    # Check SPF alignment with the visible From domain
+    if spf_result and spf_result.get("domain") and sender and "@" in sender:
+        from_domain = sender.split("@")[-1].replace(">", "").strip()
+        spf_domain = spf_result.get("domain")
+
+        spf_aligned = domains_align(
+            from_domain,
+            spf_domain
+        )
+
+        spf_result["from_domain"] = from_domain
+        spf_result["alignment"] = (
+            "aligned" if spf_aligned else "not_aligned"
+        )
+
+        if spf_aligned:
+            findings.append(
+                "SPF domain aligns with the visible From domain."
+            )
+        else:
+            findings.append(
+                "SPF domain does not align with the visible From domain."
+            )
+    # Add SPF result to evidence-based risk score
+    if spf_result:
+        spf_status = spf_result.get("status", "").lower()
+
+        if spf_status == "fail":
+            score += 25
+            score_breakdown.append({
+                "reason": "SPF failure",
+                "points": 25,
+            })
+            findings.append(
+                "SPF failed: the sending IP is not authorized to send email for this domain."
+            )
+
+        elif spf_status == "softfail":
+            score += 10
+            score_breakdown.append({
+                "reason": "SPF softfail",
+                "points": 10,
+            })
+            findings.append(
+                "SPF softfail: the domain owner discourages this sending host."
+            )
+
+        elif spf_status == "neutral":
+            findings.append(
+                "SPF neutral: the domain does not explicitly authorize or reject this sending host."
+            )
+
+        elif spf_status == "none":
+            findings.append(
+                "SPF record was not available for evaluation."
+            )
+
+        elif spf_status == "pass":
+            findings.append(
+                "SPF passed: the sending IP is authorized for the evaluated domain."
+            )
+
+        elif spf_status in ["temperror", "permerror"]:
+            findings.append(
+                f"SPF evaluation returned {spf_status}."
+            )
+    # Evaluate DMARC using the completed SPF and DKIM results
+    dmarc_evaluation = None
+
+    if sender and "@" in sender:
+        from_domain = sender.split("@")[-1].replace(">", "").strip()
+
+        dmarc_evaluation = evaluate_dmarc(
+            from_domain,
+            spf_result,
+            dkim_result
+        )
+
+        findings.append(
+            f"DMARC evaluation: {dmarc_evaluation['status']}."
+        ) 
+# 1. Check Reply-To mismatch
+    if sender and reply_to:
+        sender_domain = sender.split("@")[-1].replace(">", "").strip()
+        reply_domain = reply_to.split("@")[-1].replace(">", "").strip()
+
+        if sender_domain.lower() != reply_domain.lower():
+            score += 25
+            score_breakdown.append({
+                "reason": "Reply-To domain mismatch",
+                "points": 25,
+            })
+            findings.append(
+                "Reply-To domain differs from the sender domain."
+            )
+
+    # 2. Check suspicious urgency phrases
+    suspicious_phrases = [
+        "urgent",
+        "immediately",
+        "verify your account",
+        "verify your password",
+        "account suspended",
+        "account locked",
+        "click here",
+        "confirm your identity",
+        "payment required",
+        "act now",
+    ]
+
+    detected_phrases = []
+
+    for phrase in suspicious_phrases:
+        if phrase in email_lower:
+            detected_phrases.append(phrase)
+
+    if detected_phrases:
+        points = min(len(detected_phrases) * 5, 25)
+        score += points
+
+        score_breakdown.append({
+            "reason": "Suspicious social-engineering language",
+            "points": points,
+        })
+
+        findings.append(
+            "Suspicious social-engineering language detected: "
+            + ", ".join(detected_phrases)
+        )
+        # Detect credential requests
+    credential_phrases = [
+        "username and password",
+        "username/password",
+        "enter your password",
+        "provide your password",
+        "confirm your password",
+        "login credentials",
+        "credentials",
+        "password",
+    ]
+
+    detected_credentials = []
+
+    for phrase in credential_phrases:
+        if phrase in email_lower:
+            detected_credentials.append(phrase)
+
+    if detected_credentials:
+        score += 20
+
+        score_breakdown.append({
+            "reason": "Credential request",
+            "points": 20,
+        })
+
+        findings.append(
+            "Credential request detected: "
+            + ", ".join(detected_credentials)
+        )
+
+    # 3. Report URLs without treating their existence as malicious
+    url_count = len(urls)
+
+    if url_count > 0:
+        findings.append(
+            f"{url_count} URL(s) detected in the email."
+        )
+    # Detect suspicious login/account URLs
+    suspicious_url_words = [
+        "login",
+        "signin",
+        "verify",
+        "verification",
+        "account",
+        "secure",
+        "password",
+        "authenticate",
+    ]
+
+    suspicious_urls = []
+
+    for url in urls:
+        url_lower = url.lower()
+
+        if any(word in url_lower for word in suspicious_url_words):
+            suspicious_urls.append(url)
+
+    if suspicious_urls:
+        points = min(len(suspicious_urls) * 15, 30)
+        score += points
+
+        score_breakdown.append({
+            "reason": "Suspicious account/login URL",
+            "points": points,
+        })
+
+        findings.append(
+            "Suspicious account/login URL detected: "
+            + ", ".join(suspicious_urls)
+        )
+    # Detect possible brand impersonation in sender domain
+    impersonation_patterns = {
+        "microsoft": ["micr0soft", "microsoft-support", "microsoft-login"],
+        "google": ["g00gle", "google-security", "google-login"],
+        "apple": ["app1e", "apple-support", "apple-login"],
+        "paypal": ["paypa1", "paypal-security", "paypal-login"],
+        "amazon": ["amaz0n", "amazon-support", "amazon-login"],
+    }
+
+    sender_lower = sender.lower()
+
+    for brand, suspicious_domains in impersonation_patterns.items():
+        if brand in sender_lower:
+            if any(domain in sender_lower for domain in suspicious_domains):
+                score += 15
+
+                score_breakdown.append({
+                    "reason": f"Possible {brand.title()} sender-domain impersonation",
+                    "points": 15,
+                })
+
+                findings.append(
+                    f"Possible {brand.title()} sender-domain impersonation detected."
+                )
+                break
+    # 4. Check suspicious attachment types
+    dangerous_extensions = [
+        ".exe",
+        ".scr",
+        ".bat",
+        ".cmd",
+        ".vbs",
+        ".js",
+        ".msi",
+        ".dll",
+    ]
+
+    detected_files = [
+        extension
+        for extension in dangerous_extensions
+        if extension in email_lower
+    ]
+
+    if detected_files:
+        score += 25
+
+        score_breakdown.append({
+            "reason": "Potentially dangerous attachment",
+            "points": 25,
+        })
+
+        findings.append(
+            "Potentially dangerous attachment type detected: "
+            + ", ".join(detected_files)
+        )
+
+    # AI-assisted NLP analysis is kept separate from the existing evidence score
+    # so the same language indicators are not double-counted.
+    nlp_analysis = analyze_email_nlp(email_text, headers, urls)
+
+    score = min(score, 100)
+
+    if score >= 75:
+        risk_level = "Critical"
+    elif score >= 50:
+        risk_level = "High"
+    elif score >= 25:
+        risk_level = "Medium"
+    else:
+        risk_level = "Low"
+    # Classify the email based on detected evidence
+    classification = "Suspicious"
+
+    has_credential_request = bool(detected_credentials)
+    has_suspicious_url = bool(suspicious_urls)
+
+    if has_credential_request and has_suspicious_url:
+        classification = "Phishing"
+    elif score >= 75:
+        classification = "Phishing"
+    elif score < 25:
+        classification = "Low Risk"
+    if not findings:
+        findings.append("No obvious suspicious indicators detected.")
+
+    threat_intelligence = build_threat_intelligence_summary(
+        ip_intelligence,
+        domain_intelligence,
+        url_intelligence,
+    )
+
+    result = {
         "message": "Email analyzed successfully.",
         "headers": headers,
-        "threat_score": 0,
-        "status": "analysis_ready",
+        "spf": spf_result,
+        "dkim":dkim_result,
+        "dmarc":dmarc_result,
+        "dmarc_evaluation": dmarc_evaluation,
+        "urls": urls, 
+        "url_domains": url_domains,
+        "domain_intelligence": domain_intelligence,
+        "url_intelligence": url_intelligence,
+        "threat_intelligence": threat_intelligence,
+        "nlp_analysis": nlp_analysis,
+        "received_headers": received_headers,
+        "relay_path":relay_path,
+        "ip_addresses": ip_addresses,
+        "candidate_origin_ip":candidate_origin_ip,
+        "candidate_origin_intelligence":candidate_origin_intelligence,
+        "ip_intelligence": ip_intelligence,
+        "threat_score": score,
+        "score_breakdown": score_breakdown,
+        "risk_level": risk_level,
+        "classification": classification,
+        "findings": findings,
+        "status": "analysis_complete",
     }
+
+    result["recommendations"] = build_recommendations(result)
+
+    investigation_id = save_investigation(result)
+    result["investigation_id"] = investigation_id
+
+    # Persist the generated investigation ID inside the stored record as well.
+    update_investigation_result(investigation_id, result)
+
+    return result
+
+
+@app.get("/investigations")
+def list_investigations():
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    rows = connection.execute("""
+        SELECT id, created_at, sender, recipient, subject,
+               threat_score, risk_level, classification, origin_ip
+        FROM investigations
+        ORDER BY id DESC
+    """).fetchall()
+    connection.close()
+    return {"investigations": [dict(row) for row in rows]}
+
+
+@app.delete("/investigations/{investigation_id}")
+def delete_investigation(investigation_id: int):
+    connection = sqlite3.connect(DB_PATH)
+    cursor = connection.cursor()
+
+    cursor.execute(
+        "DELETE FROM investigations WHERE id = ?",
+        (investigation_id,),
+    )
+
+    deleted = cursor.rowcount
+    connection.commit()
+    connection.close()
+
+    if deleted == 0:
+        return {
+            "success": False,
+            "message": "Investigation not found.",
+            "investigation_id": investigation_id,
+        }
+
+    return {
+        "success": True,
+        "message": "Investigation deleted successfully.",
+        "investigation_id": investigation_id,
+    }
+
+
+@app.delete("/investigations")
+def clear_investigations():
+    connection = sqlite3.connect(DB_PATH)
+    cursor = connection.cursor()
+
+    cursor.execute("DELETE FROM investigations")
+    deleted_count = cursor.rowcount
+
+    # Reset SQLite's AUTOINCREMENT sequence after clearing test data.
+    cursor.execute(
+        "DELETE FROM sqlite_sequence WHERE name = 'investigations'"
+    )
+
+    connection.commit()
+    connection.close()
+
+    return {
+        "success": True,
+        "message": "All investigations cleared successfully.",
+        "deleted_count": deleted_count,
+    }
+
+
+@app.get("/investigations/{investigation_id}")
+def get_investigation(investigation_id: int):
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT * FROM investigations WHERE id = ?",
+        (investigation_id,),
+    ).fetchone()
+    connection.close()
+
+    if row is None:
+        return {"error": "Investigation not found."}
+
+    result = dict(row)
+    result["result"] = __import__("json").loads(result.pop("result_json"))
+    if not result["result"].get("recommendations"):
+        result["result"]["recommendations"] = build_recommendations(result["result"])
+    return result
+
+
+@app.get("/api/ip-intelligence/{ip}")
+def api_ip_intelligence(ip: str):
+    """Return geolocation and optional reputation intelligence for one public IP."""
+    if not is_public_ip(ip):
+        return {
+            "status": "invalid",
+            "ip": ip,
+            "message": "Only public IPv4/IPv6 addresses are supported.",
+        }
+
+    intelligence = lookup_ip(ip)
+    reputation = check_virustotal_ip(ip)
+    intelligence["reputation"] = reputation
+
+    malicious = int(reputation.get("malicious") or 0)
+    suspicious = int(reputation.get("suspicious") or 0)
+    if malicious > 0:
+        intelligence["threat_status"] = "High"
+    elif suspicious > 0:
+        intelligence["threat_status"] = "Medium"
+    else:
+        intelligence["threat_status"] = "No Known Threat"
+
+    return intelligence
+
+
+@app.get("/api/domain-intelligence/{domain}")
+def api_domain_intelligence(domain: str):
+    """Return passive DNS and RDAP intelligence for one domain."""
+    return check_domain_intelligence(domain)
+
+
+@app.get("/api/health")
+def api_health():
+    return {
+        "status": "healthy",
+        "service": "MailTrace AI API",
+        "virustotal_configured": bool(VIRUSTOTAL_API_KEY),
+    }
+
+
+
+def build_recommendations(result: dict):
+    """Build evidence-driven investigator actions from the stored analysis."""
+    recommendations = []
+    score = int(result.get("threat_score") or 0)
+    classification = str(result.get("classification") or "").lower()
+    findings = result.get("findings") or []
+    attachments = result.get("attachments") or []
+    urls = result.get("urls") or []
+    url_intel = result.get("url_intelligence") or []
+    threat_intel = result.get("threat_intelligence") or {}
+    dmarc_eval = result.get("dmarc_evaluation") or {}
+    spf_result = result.get("spf") or {}
+    dkim_result = result.get("dkim") or {}
+
+    if score >= 75 or "phishing" in classification or "malicious" in classification:
+        recommendations.append({
+            "priority": "High",
+            "action": "Quarantine the email and prevent further delivery or user interaction.",
+            "reason": "The investigation is classified as phishing/malicious or has a critical threat score."
+        })
+
+    critical_attachments = [a for a in attachments if str(a.get("risk", "")).lower() in {"high", "critical"}]
+    if critical_attachments:
+        names = ", ".join(str(a.get("filename") or "unnamed") for a in critical_attachments)
+        recommendations.append({
+            "priority": "High",
+            "action": f"Do not open or execute the flagged attachment(s): {names}.",
+            "reason": "Attachment intelligence identified a high-risk executable/script or suspicious attachment."
+        })
+
+    malicious_urls = sum(1 for item in url_intel if int(item.get("malicious") or 0) > 0)
+    suspicious_urls = sum(1 for item in url_intel if int(item.get("suspicious") or 0) > 0)
+    if malicious_urls > 0:
+        recommendations.append({
+            "priority": "High",
+            "action": "Block the malicious URL indicators and investigate affected users or sessions.",
+            "reason": f"Threat intelligence reported {malicious_urls} malicious URL indicator(s)."
+        })
+    elif suspicious_urls > 0 or urls:
+        recommendations.append({
+            "priority": "Medium",
+            "action": "Review detected URLs and avoid visiting them until reputation and destination checks are complete.",
+            "reason": "The email contains URL indicators that require contextual investigation."
+        })
+
+    malicious_ips = int((threat_intel.get("summary") or {}).get("malicious_ips") or 0)
+    suspicious_ips = int((threat_intel.get("summary") or {}).get("suspicious_ips") or 0)
+    if malicious_ips > 0:
+        recommendations.append({
+            "priority": "High",
+            "action": "Investigate and consider blocking the malicious IP infrastructure identified by threat intelligence.",
+            "reason": f"Threat intelligence reported {malicious_ips} malicious IP indicator(s)."
+        })
+    elif suspicious_ips > 0:
+        recommendations.append({
+            "priority": "Medium",
+            "action": "Review the suspicious IP infrastructure and correlate it with trusted mail infrastructure.",
+            "reason": f"Threat intelligence reported {suspicious_ips} suspicious IP indicator(s)."
+        })
+
+    if str(dmarc_eval.get("status", "")).lower() == "fail" or str(spf_result.get("status", "")).lower() in {"fail", "softfail", "permerror"} or str(dkim_result.get("status", "")).lower() in {"key_not_found", "invalid_header", "error"}:
+        recommendations.append({
+            "priority": "Medium",
+            "action": "Review SPF, DKIM and DMARC failures and validate the sender against trusted organizational mail infrastructure.",
+            "reason": "One or more email authentication checks did not establish trustworthy authentication."
+        })
+
+    if not result.get("candidate_origin_ip") and not result.get("relay_path"):
+        recommendations.append({
+            "priority": "Informational",
+            "action": "Preserve the original email headers if deeper infrastructure tracing is required.",
+            "reason": "No usable Received-header origin or relay path was available in the supplied message."
+        })
+
+    recommendations.append({
+        "priority": "Informational",
+        "action": "Preserve the original email, analysis evidence and forensic report for investigation records.",
+        "reason": "Evidence should remain available for correlation, review and incident documentation."
+    })
+
+    return recommendations
+
+
+def _clean_report_string(value):
+    """Normalize plain text before it is placed into a ReportLab Paragraph."""
+    value = str(value)
+
+    # Remove escape characters that commonly arrive from serialized Markdown/text.
+    value = value.replace("\\", "")
+
+    # Convert Markdown links to their visible label.  This deliberately handles
+    # any destination so URLs never appear as [label](destination) in the PDF.
+    previous = None
+    while previous != value:
+        previous = value
+        value = re.sub(r'\[([^\]]+)\]\([^)]*\)', r'\1', value)
+
+    # Remove Markdown emphasis markers.
+    value = value.replace("**", "").replace("__", "")
+    return value
+
+
+def _report_text(value):
+    """Convert report values into readable, human-friendly text."""
+    if value is None or value == "":
+        return "Not available"
+
+    if isinstance(value, dict):
+        parts = []
+        for key, item in value.items():
+            label = str(key).replace("_", " ").title()
+            parts.append(
+                f"<b>{escape(label)}:</b> {_report_text(item)}"
+            )
+        return "<br/>".join(parts)
+
+    if isinstance(value, list):
+        if not value:
+            return "None"
+
+        items = []
+        for item in value:
+            # Support rows accidentally supplied as (field, value) tuples.
+            if isinstance(item, tuple) and len(item) == 2:
+                items.append(
+                    f"<b>{escape(str(item[0]))}:</b> {_report_text(item[1])}"
+                )
+            elif isinstance(item, (dict, list, tuple)):
+                items.append(f"• {_report_text(item)}")
+            else:
+                items.append(f"• {escape(_clean_report_string(item))}")
+        return "<br/>".join(items)
+
+    if isinstance(value, tuple):
+        if len(value) == 2:
+            return (
+                f"<b>{escape(str(value[0]))}:</b> "
+                f"{_report_text(value[1])}"
+            )
+        return " • ".join(_report_text(item) for item in value)
+
+    return escape(_clean_report_string(value))
+
+
+def _add_report_section(story, title, rows, styles):
+    """Add a clean two-column forensic report section."""
+    story.append(Paragraph(escape(title), styles["Heading2"]))
+
+    table_data = [[
+        Paragraph("Field", styles["TableHeader"]),
+        Paragraph("Value", styles["TableHeader"]),
+    ]]
+
+    for field, value in rows:
+        table_data.append([
+            Paragraph(escape(str(field)), styles["BodySmallBold"]),
+            Paragraph(_report_text(value), styles["BodySmall"]),
+        ])
+
+    table = Table(
+        table_data,
+        colWidths=[48 * mm, 132 * mm],
+        repeatRows=1,
+        hAlign="LEFT",
+    )
+
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#172033")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5E1")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#F1F5F9")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+
+    story.append(table)
+    story.append(Spacer(1, 8))
+
+
+def _format_authentication(result):
+    """Create concise human-readable authentication rows."""
+    spf_result = result.get("spf") or {}
+    dkim_result = result.get("dkim") or {}
+    dmarc_policy = result.get("dmarc") or {}
+    dmarc_eval = result.get("dmarc_evaluation") or {}
+
+    return [
+        ("SPF Status", spf_result.get("status", "Not available")),
+        ("SPF Domain", spf_result.get("domain", "Not available")),
+        ("SPF Sending IP", spf_result.get("sending_ip", "Not available")),
+        ("SPF Alignment", spf_result.get("alignment", "Not available")),
+        ("SPF Explanation", spf_result.get("explanation") or spf_result.get("message") or "No additional explanation available."),
+        ("DKIM Status", dkim_result.get("status", "Not available")),
+        ("DKIM Domain", dkim_result.get("domain", "Not available")),
+        ("DKIM Selector", dkim_result.get("selector", "Not available")),
+        ("DKIM Alignment", dkim_result.get("alignment", "Not available")),
+        ("DKIM Message", dkim_result.get("message", "Not available")),
+        ("DMARC Policy Status", dmarc_policy.get("status", "Not available")),
+        ("DMARC Domain", dmarc_policy.get("domain", "Not available")),
+        ("DMARC Policy", dmarc_policy.get("record", "Not available")),
+        ("DMARC Evaluation", dmarc_eval.get("status", "Not available")),
+        ("DMARC Evaluation Reason", dmarc_eval.get("reason", "Not available")),
+    ]
+
+
+def _format_ip_intelligence(ips):
+    rows = []
+    if not ips:
+        return [("IP Intelligence", "No IP intelligence available.")]
+
+    for index, item in enumerate(ips, start=1):
+        ip = item.get("ip") or "Unknown"
+        status = item.get("status") or "Unknown"
+        location = ", ".join(
+            str(value)
+            for value in [item.get("city"), item.get("region"), item.get("country")]
+            if value
+        ) or "Unavailable"
+
+        rows.extend([
+            (f"IP {index}", ip),
+            (f"IP {index} Status", status),
+            (f"IP {index} Location", location),
+            (f"IP {index} ISP", item.get("isp") or "Unavailable"),
+            (f"IP {index} Organization", item.get("organization") or "Unavailable"),
+            (f"IP {index} ASN", item.get("asn") or "Unavailable"),
+        ])
+
+        reputation = item.get("reputation") or {}
+        if reputation:
+            rows.append((f"IP {index} Reputation", reputation.get("status") or "Unavailable"))
+            if reputation.get("malicious") is not None:
+                rows.append((f"IP {index} Malicious Detections", reputation.get("malicious", 0)))
+            if reputation.get("suspicious") is not None:
+                rows.append((f"IP {index} Suspicious Detections", reputation.get("suspicious", 0)))
+            if reputation.get("message") or reputation.get("error"):
+                rows.append((f"IP {index} Intelligence Note", "External reputation lookup was unavailable."))
+
+    return rows
+
+
+def _format_domain_intelligence(domains):
+    rows = []
+    if not domains:
+        return [("Domain Intelligence", "No domain intelligence available.")]
+
+    for index, item in enumerate(domains, start=1):
+        domain = item.get("domain") or "Unknown"
+        rows.append((f"Domain {index}", domain))
+
+        rdap = item.get("rdap") or {}
+        rows.append((f"Domain {index} RDAP", rdap.get("status") or "Unavailable"))
+
+        for label, key in [("Registrar", "registrar"), ("Created", "created"),
+                           ("Updated", "updated"), ("Expires", "expires")]:
+            if rdap.get(key):
+                rows.append((f"Domain {index} {label}", rdap.get(key)))
+
+        dns = item.get("dns") or {}
+        dns_records = []
+        for record_type in ["A", "AAAA", "MX", "NS", "TXT"]:
+            values = dns.get(record_type) or []
+            if values:
+                dns_records.append(f"{record_type}: {', '.join(map(str, values))}")
+
+        rows.append((
+            f"Domain {index} DNS",
+            "<br/>".join(escape(item) for item in dns_records)
+            if dns_records else "No common DNS records returned."
+        ))
+
+        signals = item.get("signals") or []
+        if signals:
+            rows.append((f"Domain {index} Signals", signals))
+
+        if rdap.get("status") == "error" or rdap.get("message"):
+            rows.append((
+                f"Domain {index} RDAP Note",
+                "External RDAP lookup was unavailable in this analysis environment."
+            ))
+
+    return rows
+
+
+def _format_url_intelligence(urls):
+    rows = []
+    if not urls:
+        return [("URL Intelligence", "No URL intelligence available.")]
+
+    for index, item in enumerate(urls, start=1):
+        rows.append((f"URL {index}", item.get("url") or "Unknown"))
+        rows.append((f"URL {index} Status", item.get("status") or "Unavailable"))
+
+        if item.get("malicious") is not None:
+            rows.append((f"URL {index} Malicious Detections", item.get("malicious", 0)))
+        if item.get("suspicious") is not None:
+            rows.append((f"URL {index} Suspicious Detections", item.get("suspicious", 0)))
+        if item.get("reputation") is not None:
+            rows.append((f"URL {index} Reputation", item.get("reputation")))
+
+        if item.get("status") == "error":
+            rows.append((
+                f"URL {index} Intelligence Note",
+                "External URL reputation lookup was unavailable in this analysis environment."
+            ))
+        elif item.get("message"):
+            rows.append((f"URL {index} Note", item.get("message")))
+
+    return rows
+
+
+def _format_relay_path(relay_path):
+    """Render Received headers as readable hop-by-hop evidence."""
+    rows = []
+    if not relay_path:
+        return [("SMTP Relay Path", "No Received-header relay path was available.")]
+
+    for hop in relay_path:
+        hop_number = hop.get("hop", "?")
+        header = hop.get("header") or "Not available"
+        ips = hop.get("ip_addresses") or []
+        intelligence = hop.get("intelligence") or []
+
+        rows.append((f"Hop {hop_number} Header", header))
+        rows.append((f"Hop {hop_number} IP Addresses", ips or "No IP addresses extracted"))
+
+        clues = []
+        for item in intelligence:
+            ip = item.get("ip") or "Unknown"
+            location = ", ".join(
+                str(value)
+                for value in [item.get("city"), item.get("region"), item.get("country")]
+                if value
+            ) or "Location unavailable"
+            clues.append(f"{ip}: {location}")
+
+        if clues:
+            rows.append((f"Hop {hop_number} Location Clues", clues))
+
+    return rows
+
+
+def _format_threat_intelligence(threat_intel):
+    summary = threat_intel.get("summary") or {}
+    overall = threat_intel.get("overall_status", "No Data")
+
+    if overall == "Informational":
+        overall = "Limited / No External Verdict"
+
+    return [
+        ("Threat Intelligence Status", overall),
+        ("IPs Checked", summary.get("ips_checked", 0)),
+        ("Malicious IPs", summary.get("malicious_ips", 0)),
+        ("Suspicious IPs", summary.get("suspicious_ips", 0)),
+        ("URLs Checked", summary.get("urls_checked", 0)),
+        ("Malicious URLs", summary.get("malicious_urls", 0)),
+        ("Suspicious URLs", summary.get("suspicious_urls", 0)),
+        ("Domains Checked", summary.get("domains_checked", 0)),
+        ("Indicators", threat_intel.get("indicators") or "None"),
+        ("Intelligence Note", threat_intel.get(
+            "note",
+            "External intelligence is evidence and does not by itself prove sender identity."
+        )),
+    ]
+
+
+@app.get("/investigations/{investigation_id}/report")
+def generate_investigation_report(investigation_id: int):
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        "SELECT * FROM investigations WHERE id = ?",
+        (investigation_id,),
+    ).fetchone()
+    connection.close()
+
+    if row is None:
+        return {"error": "Investigation not found."}
+
+    import json
+
+    stored = dict(row)
+
+    try:
+        result = json.loads(stored.get("result_json") or "{}")
+    except Exception:
+        result = {}
+
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(
+    name="TableHeader",
+    parent=styles["BodyText"],
+    fontName="Helvetica-Bold",
+    fontSize=8,
+    leading=10,
+))
+
+    styles.add(ParagraphStyle(
+        name="ReportTitle",
+        parent=styles["Title"],
+        alignment=TA_CENTER,
+        fontSize=20,
+        leading=24,
+        spaceAfter=8,
+        textColor=colors.HexColor("#0F172A"),
+    ))
+
+    styles.add(ParagraphStyle(
+        name="Verdict",
+        parent=styles["BodyText"],
+        alignment=TA_CENTER,
+        fontName="Helvetica-Bold",
+        fontSize=13,
+        leading=16,
+        textColor=colors.white,
+        spaceAfter=4,
+    ))
+
+    styles.add(ParagraphStyle(
+        name="VerdictSub",
+        parent=styles["BodyText"],
+        alignment=TA_CENTER,
+        fontSize=9,
+        leading=12,
+        textColor=colors.white,
+        spaceAfter=2,
+    ))
+
+    styles.add(ParagraphStyle(
+        name="ReportSubtitle",
+        parent=styles["Normal"],
+        alignment=TA_CENTER,
+        fontSize=10,
+        leading=13,
+        textColor=colors.HexColor("#475569"),
+        spaceAfter=16,
+    ))
+
+    styles.add(ParagraphStyle(
+        name="BodySmall",
+        parent=styles["BodyText"],
+        fontSize=8.5,
+        leading=11,
+        textColor=colors.HexColor("#334155"),
+    ))
+
+    styles.add(ParagraphStyle(
+        name="BodySmallBold",
+        parent=styles["BodyText"],
+        fontSize=8.5,
+        leading=11,
+        fontName="Helvetica-Bold",
+        textColor=colors.HexColor("#0F172A"),
+    ))
+
+    styles.add(ParagraphStyle(
+        name="SectionNote",
+        parent=styles["BodyText"],
+        fontSize=8,
+        leading=10,
+        textColor=colors.HexColor("#64748B"),
+        spaceAfter=7,
+    ))
+
+    styles["Heading2"].spaceBefore = 9
+    styles["Heading2"].spaceAfter = 7
+    styles["Heading2"].textColor = colors.HexColor("#0F172A")
+
+    score = result.get("threat_score", stored.get("threat_score", 0))
+    risk = result.get("risk_level", stored.get("risk_level", "Unknown"))
+    classification = result.get("classification", stored.get("classification", "Unknown"))
+
+    headers = result.get("headers", {}) or {}
+    findings = result.get("findings", []) or []
+    breakdown = result.get("score_breakdown", []) or []
+    threat_intel = result.get("threat_intelligence", {}) or {}
+    recommendations = result.get("recommendations") or build_recommendations(result)
+    attachments = result.get("attachments", []) or []
+    domains = result.get("domain_intelligence", []) or []
+    urls = result.get("url_intelligence", []) or []
+    ips = result.get("ip_intelligence", []) or []
+    relay_path = result.get("relay_path", []) or []
+
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=15 * mm,
+        leftMargin=15 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+        title=f"MailTrace AI Investigation #{investigation_id}",
+        author="MailTrace AI",
+    )
+
+    story = [
+        Paragraph("MAILTRACE AI", styles["ReportTitle"]),
+        Paragraph(
+            "Email Threat Detection & Forensics Intelligence Report",
+            styles["ReportSubtitle"],
+        ),
+    ]
+
+    assessment = (
+        f"The investigation is classified as {classification} with a threat score "
+        f"of {score}/100 and a {risk} risk level. "
+        "The score is an evidence-based investigative signal and is not a probability "
+        "of maliciousness."
+    )
+
+    verdict_text = (
+        f"VERDICT: {escape(_clean_report_string(classification).upper())}"
+        f"  •  {escape(_clean_report_string(score))}/100"
+    )
+    verdict = Table([[
+        Paragraph(
+            verdict_text + "<br/><font size=9>Risk Level: "
+            + escape(_clean_report_string(risk).upper()) + "</font>",
+            styles["Verdict"],
+        )
+    ]], colWidths=[170 * mm], hAlign="CENTER")
+    verdict.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#7F1D1D") if str(risk).lower() == "critical" else colors.HexColor("#92400E")),
+        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#991B1B")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 12),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+    ]))
+    story.extend([verdict, Spacer(1, 10)])
+
+    _add_report_section(story, "Executive Summary", [
+        ("Investigation ID", f"#{investigation_id}"),
+        ("Created", stored.get("created_at")),
+        ("Classification", classification),
+        ("Threat Score", f"{score}/100"),
+        ("Risk Level", risk),
+        ("Assessment", assessment),
+    ], styles)
+
+    _add_report_section(story, "Email Details", [
+        ("From", headers.get("from") or stored.get("sender")),
+        ("To", headers.get("to") or stored.get("recipient")),
+        ("Subject", headers.get("subject") or stored.get("subject")),
+        ("Date", headers.get("date")),
+        ("Reply-To", headers.get("reply-to")),
+        ("Return-Path", headers.get("return-path")),
+    ], styles)
+
+    nlp_analysis = result.get("nlp_analysis") or {}
+    nlp_rows = [
+        ("Engine", nlp_analysis.get("engine")),
+        ("Assessment", nlp_analysis.get("assessment")),
+        ("NLP Signal Score", f"{nlp_analysis.get('signal_score', 0)}/100"),
+        ("Primary Threat", nlp_analysis.get("primary_threat")),
+        ("Detected Categories", nlp_analysis.get("categories") or "None"),
+        ("Brand Context", nlp_analysis.get("brand_context") or "None"),
+        ("Reply-To Domain Mismatch", "Yes" if nlp_analysis.get("reply_to_domain_mismatch") else "No"),
+        ("Suspicious URL Context", nlp_analysis.get("suspicious_url_context") or "None"),
+        ("Analysis Note", nlp_analysis.get("note")),
+    ]
+    _add_report_section(story, "AI-Assisted NLP Analysis", nlp_rows, styles)
+
+    _add_report_section(
+        story,
+        "Authentication",
+        _format_authentication(result),
+        styles,
+    )
+
+    _add_report_section(story, "Forensic Infrastructure", [
+        ("Candidate Origin IP", result.get("candidate_origin_ip")),
+        ("Detected IP Addresses", result.get("ip_addresses") or []),
+        ("SMTP Relay Path", _format_relay_path(relay_path)),
+    ], styles)
+
+    if result.get("candidate_origin_intelligence"):
+        candidate = result.get("candidate_origin_intelligence") or {}
+        _add_report_section(story, "Candidate Origin Intelligence", [
+            ("IP", candidate.get("ip")),
+            ("Status", candidate.get("status")),
+            ("Country", candidate.get("country")),
+            ("Region", candidate.get("region")),
+            ("City", candidate.get("city")),
+            ("ISP", candidate.get("isp")),
+            ("Organization", candidate.get("organization")),
+            ("ASN", candidate.get("asn")),
+            ("Role", candidate.get("role")),
+        ], styles)
+
+    _add_report_section(
+        story,
+        "Threat Intelligence Summary",
+        _format_threat_intelligence(threat_intel),
+        styles,
+    )
+
+    _add_report_section(
+        story,
+        "IP Intelligence",
+        _format_ip_intelligence(ips),
+        styles,
+    )
+
+    _add_report_section(
+        story,
+        "URL Intelligence",
+        _format_url_intelligence(urls),
+        styles,
+    )
+
+    _add_report_section(
+        story,
+        "Domain Intelligence",
+        _format_domain_intelligence(domains),
+        styles,
+    )
+
+    if breakdown:
+        breakdown_rows = []
+        for item in breakdown:
+            breakdown_rows.append((
+                item.get("reason", "Evidence"),
+                f"+{item.get('points', 0)}",
+            ))
+
+        breakdown_rows.append(("Total Score", f"{score}/100"))
+        _add_report_section(story, "Score Breakdown", breakdown_rows, styles)
+    else:
+        _add_report_section(
+            story,
+            "Score Breakdown",
+            [("Total Score", f"{score}/100"), ("Evidence", "No score breakdown available.")],
+            styles,
+        )
+
+    finding_rows = []
+    for index, finding in enumerate(findings, start=1):
+        finding_rows.append((f"Finding {index}", finding))
+
+    if not finding_rows:
+        finding_rows.append(("Findings", "No obvious suspicious indicators were recorded."))
+
+    _add_report_section(story, "Security Findings", finding_rows, styles)
+
+    recommendation_rows = []
+    for index, item in enumerate(recommendations, start=1):
+        priority = item.get("priority", "Informational")
+        action = item.get("action", "Review evidence.")
+        reason = item.get("reason", "No additional reason provided.")
+
+        recommendation_rows.append((
+            f"Action {index} — {priority}",
+            {
+                "Action": _clean_report_string(action),
+                "Reason": _clean_report_string(reason),
+            },
+        ))
+
+    _add_report_section(story, "Recommended Actions", recommendation_rows, styles)
+
+    attachment_rows = [
+        ("Attachment Count", len(attachments)),
+    ]
+
+    if attachments:
+        for index, attachment in enumerate(attachments, start=1):
+            attachment_rows.extend([
+                (f"Attachment {index}", attachment.get("filename") or "Unnamed"),
+                (f"Attachment {index} Type", attachment.get("content_type") or "Unknown"),
+                (f"Attachment {index} Size", f"{attachment.get('size', 0)} bytes"),
+                (f"Attachment {index} Risk", attachment.get("risk") or "Unknown"),
+                (f"Attachment {index} Signals", attachment.get("signals") or "None"),
+                (f"Attachment {index} Analysis", attachment.get("analysis") or "Metadata-only analysis."),
+            ])
+    else:
+        attachment_rows.append(("Attachment Intelligence", "No attachments detected."))
+
+    _add_report_section(story, "Attachments", attachment_rows, styles)
+
+    detected_urls = result.get("urls") or []
+    url_domains = result.get("url_domains") or []
+
+    _add_report_section(story, "URLs & Domains", [
+        ("Detected URLs", detected_urls),
+        ("URL Domains", url_domains),
+    ], styles)
+
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Forensic Limitations", styles["Heading2"]))
+    story.append(Paragraph(
+        "• IP geolocation is approximate and does not prove the sender's identity or exact physical location.<br/>"
+        "• Received headers should be interpreted in the context of trusted mail infrastructure.<br/>"
+        "• Candidate origin IPs are investigative clues, not proof of sender identity.<br/>"
+        "• External threat-intelligence or RDAP lookup failures indicate unavailable intelligence, not a clean result.<br/>"
+        "• MailTrace AI does not execute uploaded attachments during metadata analysis.",
+        styles["BodySmall"],
+    ))
+
+    story.append(Spacer(1, 10))
+    story.append(Paragraph(
+        "Generated by MailTrace AI — Evidence-based email threat detection and forensic intelligence.",
+        styles["SectionNote"],
+    ))
+
+    def _report_page(canvas, doc):
+        canvas.saveState()
+        width, _ = A4
+        canvas.setStrokeColor(colors.HexColor("#CBD5E1"))
+        canvas.setLineWidth(0.4)
+        canvas.line(15 * mm, 11 * mm, width - 15 * mm, 11 * mm)
+        canvas.setFont("Helvetica", 6.5)
+        canvas.setFillColor(colors.HexColor("#64748B"))
+        canvas.drawString(15 * mm, 6.5 * mm, "MAILTRACE AI  •  CONFIDENTIAL")
+        canvas.drawRightString(
+            width - 15 * mm,
+            6.5 * mm,
+            f"Investigation #{investigation_id}  •  Page {doc.page}",
+        )
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=_report_page, onLaterPages=_report_page)
+    buffer.seek(0)
+
+    filename = f"mailtrace_investigation_{investigation_id}.pdf"
+
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        },
+    )
+
+
+@app.post("/upload")
+async def upload_email(file: UploadFile = File(...)):
+    if not file.filename:
+        return {"error": "No file selected."}
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+    if not file.filename.lower().endswith(".eml"):
+        return {"error": "Only .eml files are supported."}
+
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        return {
+            "error": "The uploaded email file is too large.",
+            "max_size_mb": 10,
+        }
+    if not content:
+        return {"error": "The uploaded file is empty."}
+
+    try:
+        parsed_email = BytesParser(policy=policy.default).parsebytes(content)
+        email_text = parsed_email.as_string()
+        attachments = []
+
+        for part in parsed_email.walk():
+            if part.get_content_disposition() == "attachment":
+                filename = part.get_filename()
+                content_type = part.get_content_type()
+                size = len(part.get_payload(decode=True) or b"")
+
+                attachment = analyze_attachment_metadata(
+                    filename,
+                    content_type,
+                    size,
+                )
+                attachments.append(attachment)
+    except Exception as e:
+        return {
+            "error": "The uploaded file could not be parsed as a valid email.",
+            "details": str(e),
+        }
+
+    result = analyze_email(EmailRequest(email=email_text))
+
+    result["attachments"] = attachments
+
+    # Apply attachment intelligence to the investigation score.
+    # analyze_email may already have added a generic attachment-extension signal
+    # from the serialized .eml text, so avoid double-counting the same evidence.
+    for attachment in attachments:
+        attachment_points = attachment.get("risk_points", 0)
+        attachment_risk = attachment.get("risk", "Low")
+        attachment_filename = attachment.get("filename") or "unnamed"
+
+        if attachment_points > 0:
+            already_scored = any(
+                item.get("reason") in {
+                    "Potentially dangerous attachment",
+                    "Suspicious attachment",
+                }
+                for item in result.get("score_breakdown", [])
+            )
+
+            if not already_scored:
+                result["threat_score"] = min(
+                    result["threat_score"] + attachment_points,
+                    100,
+                )
+                result["score_breakdown"].append({
+                    "reason": "Attachment intelligence",
+                    "points": attachment_points,
+                })
+
+            if attachment_risk in {"High", "Critical"}:
+                result["classification"] = "Malicious Attachment"
+
+            result["findings"].append(
+                f"Attachment intelligence flagged {attachment_filename} as {attachment_risk} risk."
+            )
+
+    result["recommendations"] = build_recommendations(result)
+
+    # Recalculate risk level after attachment scoring
+    score = result["threat_score"]
+
+    if score >= 75:
+        result["risk_level"] = "Critical"
+    elif score >= 50:
+        result["risk_level"] = "High"
+    elif score >= 25:
+        result["risk_level"] = "Medium"
+    else:
+        result["risk_level"] = "Low"
+
+    # Persist the final upload result after attachment intelligence is applied.
+    if result.get("investigation_id"):
+        update_investigation_result(result["investigation_id"], result)
+
+    return result

@@ -1,0 +1,8 @@
+From: user@gmail.com
+To: test@example.com
+Subject: Security Test
+Date: Sat, 12 Sep 2026 10:00:00 +0530
+Return-Path: <user@gmail.com>
+Received: from mail.google.com (8.8.8.8)
+
+Hello, this is a security test.

@@ -1,0 +1,27 @@
+From: Microsoft Security <security@micr0soft-support.com>
+To: employee@example.com
+Subject: URGENT: Your Microsoft 365 account will be suspended
+Date: Sun, 13 Sep 2026 14:00:00 +0530
+Reply-To: account-recovery@secure-microsoft-login.com
+Return-Path: <security@micr0soft-support.com>
+Message-ID: <security-alert-93842@micr0soft-support.com>
+Received: from suspicious-mail.example.net (185.199.108.153)
+Received: from unknown-host (45.67.89.123)
+
+Hello,
+
+URGENT SECURITY ALERT!
+
+Your Microsoft 365 account has been detected with unusual login activity.
+
+Your account will be permanently suspended within 24 hours unless you verify your identity immediately.
+
+Please verify your account using the link below:
+
+http://secure-microsoft-login.com/verify-account
+
+You must provide your username and password to complete the verification.
+
+Failure to verify your account will result in permanent account suspension.
+
+Microsoft Security Team

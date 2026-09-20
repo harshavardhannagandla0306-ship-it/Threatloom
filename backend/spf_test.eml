@@ -1,0 +1,13 @@
+From: Test Sender <sender@gmail.com>
+To: employee@example.com
+Subject: SPF Test Message
+Date: Sun, 13 Sep 2026 17:00:00 +0530
+Return-Path: <sender@gmail.com>
+Received: from mail.example.net (8.8.8.8)
+
+Hello,
+
+This is a test message for SPF analysis.
+
+Regards,
+Test Sender

@@ -1,0 +1,27 @@
+From: Billing Department <billing@example.com>
+To: employee@example.com
+Subject: Urgent Invoice Document
+Date: Sun, 13 Sep 2026 16:00:00 +0530
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="BOUNDARY123"
+
+--BOUNDARY123
+Content-Type: text/plain; charset="UTF-8"
+
+Hello,
+
+Please find the invoice attached.
+
+Please review it immediately.
+
+Regards,
+Billing Department
+
+--BOUNDARY123
+Content-Type: application/octet-stream
+Content-Disposition: attachment; filename="invoice.exe"
+Content-Transfer-Encoding: base64
+
+VGhpcyBpcyBhIHNhZmUgZmFrZSBhdHRhY2htZW50Lg==
+
+--BOUNDARY123--
