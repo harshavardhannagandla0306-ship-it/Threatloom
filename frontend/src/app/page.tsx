@@ -34,7 +34,7 @@ export default function Home() {
   const [selectedInvestigation, setSelectedInvestigation] = useState<any>(null);
   const [historyError, setHistoryError] = useState("");
 useEffect(() => {
-    fetch("https://threatloom.onrender.com")
+    fetch("https://threatloom.onrender.com/health")
       .then((response) => response.json())
       .then((data) => {
         setBackendStatus(data.status === "healthy" ? "Online" : "Offline");
