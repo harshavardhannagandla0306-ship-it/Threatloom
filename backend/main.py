@@ -29,7 +29,10 @@ app = FastAPI(title="MailTrace AI API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+    "http://localhost:3000",
+    "https://harshavardhannagandla0306-ship-it.github.io",
+],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -34,7 +34,7 @@ export default function Home() {
   const [selectedInvestigation, setSelectedInvestigation] = useState<any>(null);
   const [historyError, setHistoryError] = useState("");
 useEffect(() => {
-    fetch("http://127.0.0.1:8001/health")
+    fetch("https://threatloom.onrender.com")
       .then((response) => response.json())
       .then((data) => {
         setBackendStatus(data.status === "healthy" ? "Online" : "Offline");
@@ -52,7 +52,7 @@ useEffect(() => {
     setHistoryLoading(true);
     setHistoryError("");
     try {
-      const response = await fetch("http://127.0.0.1:8001/investigations");
+      const response = await fetch("https://threatloom.onrender.com/investigations");
       const data = await response.json();
       if (!response.ok) throw new Error(data.message || "Failed to load investigations.");
       setInvestigations(Array.isArray(data.investigations) ? data.investigations : []);
@@ -66,7 +66,7 @@ useEffect(() => {
 
   const viewInvestigation = async (id: number) => {
     try {
-      const response = await fetch(`http://127.0.0.1:8001/investigations/${id}`);
+      const response = await fetch(`https://threatloom.onrender.com/investigations/${id}`);
       const data = await response.json();
       if (!response.ok) throw new Error(data.message || "Failed to load investigation.");
       setSelectedInvestigation(data.investigation || data);
@@ -83,7 +83,7 @@ useEffect(() => {
   const formData = new FormData();
   formData.append("file", selectedFile);
 
-  const response = await fetch("http://127.0.0.1:8001/upload", {
+  const response = await fetch("https://threatloom.onrender.com/upload", {
     method: "POST",
     body: formData,
   });
@@ -186,7 +186,7 @@ setAnalysis(
     setNlpAnalysis(null);
   
     try {
-      const response = await fetch("http://127.0.0.1:8001/analyze", {
+      const response = await fetch("https://threatloom.onrender.com/analyze", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
